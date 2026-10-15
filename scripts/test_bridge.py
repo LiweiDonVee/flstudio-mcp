@@ -150,14 +150,24 @@ def main() -> int:
         print("      after 2nd record: %s" % rec2)
 
     # ----- cleanup: never leave playback running or record armed -----
+    # transport.record() is a toggle and its reply reports the PREVIOUS state,
+    # and get_play_state can lag a tick behind the toggle, so poll with a short
+    # delay instead of assuming one extra toggle lands on False. Leaving the
+    # run with record armed would surprise the next run.
     try:
         bridge.call(CMD_STOP)
         state = bridge.call(CMD_GET_PLAY_STATE)
-        if state.get("recording"):
+        for _ in range(5):
+            if not state.get("recording"):
+                break
             bridge.call(CMD_RECORD)
+            time.sleep(0.3)         # let FL settle before re-reading
             state = bridge.call(CMD_GET_PLAY_STATE)
         bridge.call(CMD_SET_SONG_POS, {"beats": 0.0})
         print("  cleanup (stopped / disarmed / pos reset): %s" % state)
+        if state.get("recording"):
+            print("  cleanup WARNING: still recording after retries")
+            all_ok = False
     except Exception as e:  # pragma: no cover
         print("  cleanup warning: %s" % e)
 

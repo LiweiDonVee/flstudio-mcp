@@ -144,7 +144,9 @@ CMD_CHANNEL_GET_COLOR = "channel_get_color"
 # Plugin presets (navigate/read) -- op: info | next | prev
 CMD_PLUGIN_PRESET = "plugin_preset"                    # getPresetCount/next/prev/getName
 
-# API introspection / arrangement probe -- op: dir | ppq | marker_add | undo
+# API introspection / arrangement probe -- op: dir | ppq | step | pat | jump | marker_add | undo
+# (op "step", "pat" and "jump" are READ-ONLY probes: step-grid/focus,
+#  pattern metadata, and jumpToPattern bounds; none of them mutate the project)
 CMD_API_PROBE = "api_probe"
 
 # Arrangement primitives (Slice 1) -- pattern create/clone + section markers

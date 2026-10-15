@@ -290,7 +290,7 @@ def _h_ping(params):
     return {
         "fl_version": _fl_version,
         "protocol_version": PROTOCOL_VERSION,
-        "build": "color-v14",   # reload marker -- bump to verify reloads take
+        "build": "probe-v16",   # reload marker -- bump to verify reloads take
         "ts": time.time(),
     }
 
@@ -419,6 +419,18 @@ def _paginate(total, start, entry_fn, key):
             break
     return {"total": total, "start": start,
             "next_start": (i if i < total else None), key: out}
+
+
+def _fits(env):
+    """True when a response envelope's compact JSON stays inside _LIST_BUDGET.
+
+    Budgets the COMPLETE serialized response, not one field: ASCII escaping
+    expands every non-ASCII char to six bytes, so a 40-char Tamil caption is
+    240 B alone and per-field caps (`[:40]`, `[:60]`) do not keep a page
+    under the SysEx budget. Callers measure the whole envelope they are
+    about to return -- including any exception strings.
+    """
+    return len(json.dumps(env, separators=(",", ":"))) <= _LIST_BUDGET
 
 
 def _h_get_project_state(params):
@@ -882,8 +894,28 @@ def _h_plugin_preset(p):
 def _h_api_probe(p):
     """op:
       dir    -> {module, names}: public names of one FL module (per-module to
-                stay under the SysEx size limit).
+                stay under the SysEx size limit). Paginated via start/next_start.
       ppq    -> {ppq, pattern_count, pattern_number}
+      step   -> READ-ONLY Channel Rack step-grid + focus/status introspection:
+                grid bits of one channel (channels.getGridBit /
+                isGridBitAssigned), ui.getStepEditMode, focus + hint and
+                piano-roll visibility. No writes.
+                Budget-limited: the COMPLETE response is measured against
+                _LIST_BUDGET (ASCII-escaped caption/hint/exception strings
+                included), variable strings are trimmed until the envelope
+                fits, then grid bits are appended while it still fits --
+                at most 16 per call, windowed by start/next_start.
+      pat    -> READ-ONLY pattern metadata: getPatternName/getPatternLength/
+                getPatternColor/isPatternSelected for one index, plus
+                patternCount/patternNumber/patternMax/findFirstNextEmptyPat.
+                No jump, no rename, no create.
+      jump   -> READ-ONLY patterns.jumpToPattern bounds probe: jumps to
+                `index`, reports patternNumber, then restores the pattern
+                that was ACTUALLY selected at entry (captured before the
+                jump, restored in a finally -- never a caller-supplied
+                target; `back` is accepted but ignored). Creates no
+                patterns (verified 0/999/1000 all leave patternCount
+                unchanged).
       marker_add -> arrangement.addAutoTimeMarker(time, name)
       undo   -> general.undoUp() (best-effort, to remove a test marker)
     """
@@ -897,16 +929,169 @@ def _h_api_probe(p):
             return {"module": p.get("module"), "error": "module not available"}
         names = [n for n in dir(mod) if not n.startswith("_")]
         start = max(0, int(p.get("start", 0)))      # budget-paginate (dir is large)
+        module_key = p.get("module", "playlist")
         out, i = [], start
         while i < len(names):
             out.append(names[i])
             i += 1
-            if len(json.dumps(out, separators=(",", ":"))) > 600 and len(out) > 1:
+            # Budget: measure the FULL returned envelope
+            # {module,total,start,next_start,names} like _paginate() -- names-only
+            # under-measured by the envelope bytes and first pages shipped
+            # 652-658 B (contract: data <= 600 B).
+            size = len(json.dumps(
+                {"module": module_key, "total": len(names), "start": start,
+                 "next_start": (i if i < len(names) else None), "names": out},
+                separators=(",", ":")))
+            if size > _LIST_BUDGET and len(out) > 1:
                 out.pop()
                 i -= 1
                 break
-        return {"module": p.get("module", "playlist"), "total": len(names),
+        return {"module": module_key, "total": len(names),
                 "start": start, "next_start": (i if i < len(names) else None), "names": out}
+    if op == "step":
+        # READ-ONLY probe: no setters, no UI commands, nothing to undo.
+        # Budget: the COMPLETE serialized response must fit _LIST_BUDGET, not
+        # just a grid window -- ASCII escaping expands each non-ASCII char to
+        # six bytes, so a wide caption + hint + exception strings measured
+        # 964 B in review (the transport silently drops oversized pages).
+        # Build the fixed focus/hint block first, trim its variable strings
+        # until the whole envelope fits with room for one grid bit, then
+        # append bits while it still fits (<=16 per call, start/next_start).
+        ch = int(p.get("channel", 0))
+        steps = max(1, min(64, int(p.get("steps", 16))))     # hard read cap
+        start = max(0, min(steps - 1, int(p.get("start", 0))))
+        end = min(steps, start + 16)                          # 16 per page
+        base = {"channel": ch, "steps": steps, "start": start}
+        probes = (
+            ("step_edit_mode", lambda: ui.getStepEditMode()),
+            ("piano_roll_focused", lambda: ui.getFocused(getattr(midi, "widPianoRoll", -1))),
+            ("focused_form_id", lambda: ui.getFocusedFormID()),
+            ("focused_caption", lambda: (ui.getFocusedFormCaption() or "")[:40]),
+            ("hint", lambda: (ui.getHintMsg() or "")[:60]),
+            ("piano_roll_visible", lambda: ui.getVisible(getattr(midi, "widPianoRoll", -1))),
+            ("step_mode_has_setter", lambda: hasattr(ui, "setStepEditMode")),
+            ("run_script_api", lambda: hasattr(ui, "runScript")),
+        )
+        for key, fn in probes:
+            try:
+                base[key] = fn()
+            except Exception as e:
+                base[key] = f"err: {type(e).__name__}: {e}"
+
+        def _page(bits, assigned, nxt, err):
+            d = dict(base, grid_bits=bits, grid_assigned=assigned,
+                     next_start=nxt)
+            if err:
+                d["grid_error"] = err
+            return d
+
+        # Trim the longest variable string (caption, hint, exception text --
+        # measured AFTER json escaping) until the envelope fits with room for
+        # the first bit, worst-case encoding: a page that can never grow
+        # would stall start/next_start pagination.
+        probe_nxt = (start + 1) if start + 1 < steps else None
+        while not _fits(_page([1], [False], probe_nxt, None)):
+            keys = [k for k, v in base.items() if isinstance(v, str) and v]
+            if not keys:
+                break
+            k = max(keys, key=lambda key: len(str(base[key])))
+            base[k] = str(base[k])[: len(str(base[k])) // 2]
+
+        bits, assigned, err = [], [], None
+        for i in range(start, end):
+            try:
+                bit = 1 if channels.getGridBit(ch, i) else 0
+            except Exception as e:
+                err = f"err: {type(e).__name__}: {e}"
+                # Error text is budgeted too, but never trimmed below the
+                # stable "err: " prefix so callers can still detect it.
+                while len(err) > 11 and not _fits(_page(bits, assigned, None, err)):
+                    err = err[: len(err) // 2]
+                break
+            try:
+                a = bool(channels.isGridBitAssigned(ch, i))
+            except Exception:
+                a = None
+            nxt = start + len(bits) + 1
+            nxt = nxt if nxt < steps else None
+            if not _fits(_page(bits + [bit], assigned + [a], nxt, err)):
+                break                             # page full -> resume here
+            bits.append(bit)
+            assigned.append(a)
+        if err is not None:
+            return _page(bits, assigned, None, err)
+        nxt = start + len(bits)
+        return _page(bits, assigned, (nxt if nxt < steps else None), None)
+    if op == "pat":
+        # READ-ONLY pattern metadata. No jump/rename/create.
+        idx = int(p.get("index", 1))
+        out = {"index": idx}
+        if idx < 1:
+            # patterns.* indexes are 1-based; FL 26 crashes on jumpToPattern
+            # (<0), so never hand a non-positive index to any patterns.* call.
+            out["index_error"] = f"rejected index {idx}: pattern indexes are >= 1"
+            return out
+        probes = (
+            ("name", lambda: patterns.getPatternName(idx)),
+            ("length", lambda: patterns.getPatternLength(idx)),
+            ("color", lambda: patterns.getPatternColor(idx)),
+            ("selected", lambda: patterns.isPatternSelected(idx)),
+            ("count", lambda: patterns.patternCount()),
+            ("number", lambda: patterns.patternNumber()),
+            ("max", lambda: patterns.patternMax()),
+            ("next_empty", lambda: patterns.findFirstNextEmptyPat()),
+            ("has_set_name", lambda: hasattr(patterns, "setPatternName")),
+            ("has_set_length", lambda: hasattr(patterns, "setPatternLength")),
+        )
+        for key, fn in probes:
+            try:
+                out[key] = fn()
+            except Exception as e:
+                out[key] = f"err: {type(e).__name__}: {e}"
+        return out
+    if op == "jump":
+        # READ-ONLY probe of patterns.jumpToPattern bounds. Jumps to `index`,
+        # reports the resulting patternNumber, then restores the pattern that
+        # was ACTUALLY selected at entry -- captured before the jump and
+        # restored in a finally, so an exception mid-probe can never leave a
+        # different pattern selected. A caller-supplied `back` is ignored
+        # (review: back=9 left pattern 9 selected when the project started on
+        # 7). Answers: what does FL do when you jump past patternMax / to 0?
+        idx = int(p.get("index", 1))
+        out = {"tried": idx}
+        # GUARD: FL 26.1.7 crashes (EAccessViolation, main thread; the bridge
+        # sees a timeout) on patterns.jumpToPattern(<0) -- reproduced on
+        # Producer Edition v26.1.7 [build 5419]. Never hand FL a negative
+        # index; reject it here instead.
+        if idx < 1:
+            out["jump_error"] = (f"rejected index {idx}: jumpToPattern needs >= 1 "
+                                 "(FL crashes on <0)")
+            return out
+        try:
+            initial = int(patterns.patternNumber())
+        except Exception as e:
+            out["jump_error"] = f"cannot read initial pattern: {type(e).__name__}: {e}"
+            return out
+        out["start"] = initial
+        if "back" in p:
+            out["back_ignored"] = ("restore target is the pattern selected "
+                                   "at entry, not `back`")
+        try:
+            patterns.jumpToPattern(idx)
+            out["after_jump_number"] = patterns.patternNumber()
+        except Exception as e:
+            out["jump_error"] = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                if initial >= 1:
+                    patterns.jumpToPattern(initial)
+                    out["restored_number"] = patterns.patternNumber()
+                else:
+                    out["restore_error"] = (f"initial patternNumber {initial} "
+                                            "is not a valid jump target")
+            except Exception as e:
+                out["restore_error"] = f"{type(e).__name__}: {e}"
+        return out
     if op == "ppq":
         out = {}
         for key, fn in (("ppq", lambda: general.getRecPPQ()),
@@ -973,6 +1158,11 @@ def _h_arrange_clone_pattern(p):
     """Clone a pattern (copies its notes) and rename the clone. Reports
     count before/after + the clone's selected index so we can see what FL did."""
     src = int(p["src"])
+    # GUARD: FL 26.1.7 crashes (EAccessViolation) on jumpToPattern(<0).
+    # The MCP tool layer validates src >= 1, but raw RPC commands bypass it.
+    if src < 1:
+        return {"ok": False, "error": f"rejected src {src}: pattern index must be >= 1 "
+                "(FL crashes on jumpToPattern(<0))"}
     new_name = p.get("new_name", "CLONE")
     patterns.jumpToPattern(src)
     before = patterns.patternCount()
