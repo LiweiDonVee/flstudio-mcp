@@ -32,13 +32,17 @@ the same server connection. Reconnecting starts with dry-run off. After updating
 the source, restart the daemon and reconnect every existing MCP client to load
 the updated code; a server started before the update retains its old functions.
 
-## Windows plugin parameter names
+## Known Windows Emphasizer parameter names
 
-On the tested localized Windows build, `plugins.getParamName` returned UTF-8
-Chinese names decoded as GBK. Parameter-list, single-parameter and setter echoes
-use the same strict GBK-to-UTF-8 repair. Failed conversions return the original
-name. The conversion is limited to this source on Windows: ordinary track names
-and parameter display strings retain their existing handling.
+On the tested localized Windows build, `plugins.getParamName` returned four
+Emphasizer labels as UTF-8 Chinese names decoded as GBK. Parameter-list,
+single-parameter and setter echoes use the same exact mapping for those four
+verified labels, limited to Emphasizer on Windows. Unknown names, other plugins,
+other platforms, track names and display strings retain their original text.
+
+A generic encoding round-trip is insufficient to detect corruption: valid
+short names such as `湿` and `L路` also decode successfully into different text.
+Regression tests explicitly preserve those names.
 
 ## Validation
 

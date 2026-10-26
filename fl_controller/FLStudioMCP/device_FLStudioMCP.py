@@ -714,15 +714,27 @@ def _h_plugin_list(p):
     return {"track": track, "slots": slots}
 
 
+_EMPHASIZER_PARAM_NAME_REPAIRS = {
+    "杈撳叆澧炵泭": "输入增益",
+    "鐢靛钩鍖归厤": "电平匹配",
+    "鏃佽矾": "旁路",
+    "杈撳嚭澧炵泭": "输出增益",
+}
+
+
 def _plugin_param_name(index, track, slot):
     name = plugins.getParamName(index, track, slot)
-    # Some localized Windows FL builds decode plugin UTF-8 names as GBK.
-    # Keep the repair limited to this API source and require a strict round-trip.
-    if sys.platform == "win32" and name:
-        try:
-            return name.encode("gbk", "strict").decode("utf-8", "strict")
-        except (UnicodeError, LookupError):
-            pass
+    # Successful GBK -> UTF-8 decoding is not proof of mojibake: correct
+    # short labels such as "湿" and "L路" can also round-trip to different text.
+    # Repair only the exact Windows/Emphasizer cases verified in FL.
+    if sys.platform != "win32" or name not in _EMPHASIZER_PARAM_NAME_REPAIRS:
+        return name
+    try:
+        plugin = plugins.getPluginName(track, slot)
+    except Exception:
+        return name
+    if str(plugin).casefold() == "emphasizer":
+        return _EMPHASIZER_PARAM_NAME_REPAIRS[name]
     return name
 
 
