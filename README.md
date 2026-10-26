@@ -170,6 +170,12 @@ Linux is not yet supported — contributions welcome.
 
 Verify the connection by asking Claude to call `fl_ping`.
 
+After updating an existing installation, restart the bridge daemon and reconnect
+your MCP client so both processes load the new source. Dry-run is scoped to one
+MCP server process and resets on reconnect. See
+[bridge correctness regressions](docs/bridge-correctness-regressions.md) for
+numeric JSON compatibility, dry-run behavior, and localized parameter names.
+
 ## Troubleshooting
 
 | Symptom | Fix |

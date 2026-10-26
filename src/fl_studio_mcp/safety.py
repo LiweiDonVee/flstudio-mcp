@@ -88,6 +88,16 @@ def is_dry_run() -> bool:
     return _dry_run
 
 
+def preview_write(*, tool, params=None, command=None):
+    """Return a dry-run plan before any FL, note-script, or undo-log action."""
+    if not _dry_run:
+        return None
+    planned = {"tool": tool, "params": params or {}}
+    if command is not None:
+        planned["command"] = command
+    return {"ok": True, "dry_run": True, "planned": planned}
+
+
 def get_changelog() -> ChangeLog:
     return _log
 
@@ -146,12 +156,9 @@ def safe_write(bridge, *, tool, scope, command, params, build_restore, verify=No
     this change. ``verify=(field, expected)`` re-issues the command until the
     reported state matches (used for flaky toggle writes like mute/solo).
     """
-    if _dry_run:
-        return {
-            "ok": True,
-            "dry_run": True,
-            "planned": {"tool": tool, "command": command, "params": params},
-        }
+    preview = preview_write(tool=tool, command=command, params=params)
+    if preview is not None:
+        return preview
     before = take_snapshot(bridge, scope)
     restore = build_restore(before)
     echo = bridge.call(command, params)
@@ -207,6 +214,9 @@ def safe_write_group(bridge, *, tool, scope, writes):
 
 
 def rollback_last_change(bridge):
+    preview = preview_write(tool="rollback_last_change")
+    if preview is not None:
+        return preview
     entry = _log.pop_last()
     if entry is None:
         return {"ok": False, "error": "changelog is empty"}
